@@ -16,6 +16,50 @@ import time
 import bz2
 import pickle
 from math import sqrt, ceil
+from torch.onnx import operators
+
+# @torch.jit.script
+# def append_if_not_empty(tensor_list, tensor):
+#     if tensor.shape != torch.tensor([0], dtype=torch.long):
+#         tensor_list.append(tensor)
+#     return tensor_list
+torch.ops.load_library(os.path.join(os.path.dirname(__file__), 'lib', 'custom_ops.cpython-37m-x86_64-linux-gnu.so'))
+
+@torch.jit.script
+def decode_batch_loop_helper(bboxes, probs, criteria, max_output):
+    bboxes_out = torch.jit.annotate(List[Tensor], [])
+    scores_out = torch.jit.annotate(List[Tensor], [])
+    labels_out = torch.jit.annotate(List[Tensor], [])
+    for i in range(probs.size(1)):
+        # skip background
+        if i != 0:
+            scores_per_label = probs[:, i]
+            mask = scores_per_label > 0.05
+            bboxes_masked, scores_masked = bboxes[mask, :], scores_per_label[mask]
+            print('decode single iter scores masked:', scores_masked, scores_masked.shape)
+
+            num_selected = operators.shape_as_tensor(scores_masked)[0].unsqueeze(0)
+            k = torch.min(
+                torch.cat(
+                    (max_output,
+                    num_selected), 0))
+            _, sorted_idx = scores_masked.topk(k, dim=0)
+            bboxes_masked = bboxes_masked[sorted_idx]
+            scores_masked = scores_masked[sorted_idx]
+
+            out_idx = torch.ops.roi_ops.nms(bboxes_masked, scores_masked, criteria)
+
+            bboxes_out.append(bboxes_masked[out_idx])
+            scores_out.append(scores_masked[out_idx])
+            labels_out.append(torch.full(out_idx.shape, i, dtype=torch.long))
+            print('decode single iter output:', scores_out[-1], labels_out[-1])
+    # return top max_output
+    bboxes_out = torch.cat(bboxes_out, dim=0)
+    labels_out = torch.cat(labels_out, dim=0)
+    scores_out = torch.cat(scores_out, dim=0)
+
+    return bboxes_out, labels_out, scores_out
+
 
 # This function is from https://github.com/kuangliu/pytorch-ssd.
 def calc_iou_tensor(box1, box2):
@@ -130,32 +174,187 @@ class Encoder(object):
         scores_in = scores_in.permute(0, 2, 1)
         #print(bboxes_in.device, scores_in.device, self.dboxes_xywh.device)
 
-        bboxes_in[:, :, :2] = self.scale_xy*bboxes_in[:, :, :2]
-        bboxes_in[:, :, 2:] = self.scale_wh*bboxes_in[:, :, 2:]
+        # bboxes_in[:, :, :2] = self.scale_xy*bboxes_in[:, :, :2]
+        # bboxes_in[:, :, 2:] = self.scale_wh*bboxes_in[:, :, 2:]
 
-        bboxes_in[:, :, :2] = bboxes_in[:, :, :2]*self.dboxes_xywh[:, :, 2:] + self.dboxes_xywh[:, :, :2]
-        bboxes_in[:, :, 2:] = bboxes_in[:, :, 2:].exp()*self.dboxes_xywh[:, :, 2:]
+        # bboxes_in[:, :, :2] = bboxes_in[:, :, :2]*self.dboxes_xywh[:, :, 2:] + self.dboxes_xywh[:, :, :2]
+        # bboxes_in[:, :, 2:] = bboxes_in[:, :, 2:].exp()*self.dboxes_xywh[:, :, 2:]
+
+        # # Transform format to ltrb 
+        # l, t, r, b = bboxes_in[:, :, 0] - 0.5*bboxes_in[:, :, 2],\
+        #              bboxes_in[:, :, 1] - 0.5*bboxes_in[:, :, 3],\
+        #              bboxes_in[:, :, 0] + 0.5*bboxes_in[:, :, 2],\
+        #              bboxes_in[:, :, 1] + 0.5*bboxes_in[:, :, 3]
+
+        # bboxes_in[:, :, 0] = l
+        # bboxes_in[:, :, 1] = t
+        # bboxes_in[:, :, 2] = r
+        # bboxes_in[:, :, 3] = b
+
+        # print('bboxes_in:', bboxes_in)
+        # return bboxes_in, F.softmax(scores_in, dim=-1)
+
+        # WORK AROUND in-place assignments
+        bboxes_in_xy = self.scale_xy*bboxes_in[:, :, :2]
+        bboxes_in_wh = self.scale_wh*bboxes_in[:, :, 2:]
+
+        bboxes_in_xy = bboxes_in_xy*self.dboxes_xywh[:, :, 2:] + self.dboxes_xywh[:, :, :2]
+        bboxes_in_wh = bboxes_in_wh.exp()*self.dboxes_xywh[:, :, 2:]
 
         # Transform format to ltrb 
-        l, t, r, b = bboxes_in[:, :, 0] - 0.5*bboxes_in[:, :, 2],\
-                     bboxes_in[:, :, 1] - 0.5*bboxes_in[:, :, 3],\
-                     bboxes_in[:, :, 0] + 0.5*bboxes_in[:, :, 2],\
-                     bboxes_in[:, :, 1] + 0.5*bboxes_in[:, :, 3]
+        l, t, r, b = bboxes_in_xy[:, :, 0] - 0.5*bboxes_in_wh[:, :, 0],\
+                     bboxes_in_xy[:, :, 1] - 0.5*bboxes_in_wh[:, :, 1],\
+                     bboxes_in_xy[:, :, 0] + 0.5*bboxes_in_wh[:, :, 0],\
+                     bboxes_in_xy[:, :, 1] + 0.5*bboxes_in_wh[:, :, 1]
 
-        bboxes_in[:, :, 0] = l
-        bboxes_in[:, :, 1] = t
-        bboxes_in[:, :, 2] = r
-        bboxes_in[:, :, 3] = b
+        bboxes_in_out = torch.cat((l.unsqueeze(2),t.unsqueeze(2),r.unsqueeze(2),b.unsqueeze(2)), dim=2)
 
-        return bboxes_in, F.softmax(scores_in, dim=-1)
-   
+        return bboxes_in_out, F.softmax(scores_in, dim=-1)
+
+    def decode_batch_with_nms(self, bboxes_in, scores_in, criteria = 0.45, max_output=200, device=0):
+        bboxes, probs = self.scale_back_batch(bboxes_in, scores_in, device)
+
+
+        assert bboxes.size(0) == 1, 'batch size must be 1'
+        bboxes = bboxes.squeeze(0)
+        probs = probs.squeeze(0)
+        # for each label
+        bboxes_out = []
+        scores_out = []
+        labels_out = []
+        # bboxes_out = torch.tensor([], dtype=torch.float32)
+        # scores_out = torch.tensor([], dtype=torch.float32)
+        # labels_out = torch.tensor([], dtype=torch.long)
+        # bboxes shape  [box num, 4]
+        # probs shape   [box num, label num]
+        bboxes_out, labels_out, scores_out = decode_batch_loop_helper(bboxes, probs, torch.tensor(criteria, dtype=torch.float32), torch.tensor([max_output], dtype=torch.long))
+
+        num_selected = operators.shape_as_tensor(scores_out)[0].unsqueeze(0)
+        k = torch.min(
+            torch.cat(
+                (torch.tensor([max_output], dtype=torch.long), num_selected),
+                0
+            )
+        )
+        _, max_ids = scores_out.topk(k, dim=0)
+
+        return bboxes_out[max_ids, :].unsqueeze(0), labels_out[max_ids].unsqueeze(0), scores_out[max_ids].unsqueeze(0)
+
+    def decode_batch_with_nms_trace(self, bboxes_in, scores_in, criteria = 0.45, max_output=200, device=0):
+        bboxes, probs = self.scale_back_batch(bboxes_in, scores_in, device)
+
+        torch.ops.load_library(os.path.join(os.path.dirname(__file__), 'lib', 'custom_ops.cpython-37m-x86_64-linux-gnu.so'))
+
+        assert bboxes.size(0) == 1, 'batch size must be 1'
+        bboxes = bboxes.squeeze(0)
+        probs = probs.squeeze(0)
+        # for each label
+        bboxes_out = []
+        scores_out = []
+        labels_out = []
+        # bboxes shape  [box num, 4]
+        # probs shape   [box num, label num]
+        for i in range(probs.size(1)):
+            # skip background
+            if i == 0:
+                continue
+
+            scores_per_label = probs[:, i]
+            mask = scores_per_label > 0.05
+            bboxes_masked, scores_masked = bboxes[mask, :], scores_per_label[mask]
+            print('decode single iter scores masked:', scores_masked, scores_masked.shape)
+
+            num_selected = operators.shape_as_tensor(scores_masked)[0].unsqueeze(0)
+            k = torch.min(
+                torch.cat(
+                    (torch.tensor([max_output], dtype=torch.long),
+                     num_selected), 0))
+            _, sorted_idx = scores_masked.topk(k, dim=0)
+            bboxes_masked = bboxes_masked[sorted_idx]
+            scores_masked = scores_masked[sorted_idx]
+
+            out_idx = torch.ops.roi_ops.nms(bboxes_masked, scores_masked, criteria)
+
+            bboxes_out.append(bboxes_masked[out_idx])
+            scores_out.append(scores_masked[out_idx])
+            labels_out.append(torch.full_like(out_idx, i, dtype=torch.long))
+            print('decode single iter output:', scores_out[-1], labels_out[-1])
+        # return top max_output
+        bboxes_out = torch.cat(bboxes_out, dim=0)
+        labels_out = torch.cat(labels_out, dim=0)
+        scores_out = torch.cat(scores_out, dim=0)
+
+        num_selected = operators.shape_as_tensor(scores_out)[0].unsqueeze(0)
+        k = torch.min(
+            torch.cat(
+                (torch.tensor([max_output], dtype=torch.long), num_selected),
+                0
+            )
+        )
+        _, max_ids = scores_out.topk(k, dim=0)
+
+        return bboxes_out[max_ids, :].unsqueeze(0), labels_out[max_ids].unsqueeze(0), scores_out[max_ids].unsqueeze(0)
+
+
+    def decode_batch_with_nms_trace_new(self, bboxes_in, scores_in, criteria = 0.45, max_output=200, device=0):
+        bboxes, probs = self.scale_back_batch(bboxes_in, scores_in, device)
+
+        torch.ops.load_library(os.path.join(os.path.dirname(__file__), 'lib', 'custom_ops.cpython-37m-x86_64-linux-gnu.so'))
+
+        # bboxes shape  [batch, box num, 4]
+        # probs shape   [batch, box num, label num]
+        probs = probs.permute(0, 2, 1)
+        # probs shape   [batch, label num, box num]
+
+        # TODO: how to trace entire block of python code as one operator?
+        print('start selecting with multi labels')
+        # remove background
+        probs = probs[:, 1:, :]
+        selected_indices = torch.ops.roi_ops.multi_label_nms(bboxes, probs, torch.full((1,), max_output, dtype=torch.long), torch.full((1, ), criteria, dtype=torch.float), torch.full((1, ), 0.05, dtype=torch.float))
+        print('selected indices:', selected_indices)
+
+        labels = selected_indices[:, 1]
+        print('labels:', (labels,), labels.shape[0])
+        box_indices = selected_indices[:, 2]
+        print('box indices:', box_indices)
+        print('label * boxes:', labels * operators.shape_as_tensor(probs)[2])
+        print('complete indices:', labels * operators.shape_as_tensor(probs)[2] + box_indices)
+        scores_out = probs.reshape(-1)[labels * operators.shape_as_tensor(probs)[2] + box_indices]
+        print('scores_out:', sorted(scores_out.numpy()))
+
+        # return top max_output
+        num_selected = operators.shape_as_tensor(scores_out)[0].unsqueeze(0)
+        k = torch.min(
+            torch.cat(
+                (torch.tensor([max_output], dtype=torch.long), num_selected),
+                0
+            )
+        )
+        _, max_ids = scores_out.topk(k, dim=0)
+        # print('max ids:', max_ids)
+        # print('max out:', max_out)
+        # print('labels:', labels[max_ids])
+        bboxes = bboxes.squeeze(0)[box_indices.index_select(0, max_ids), :].unsqueeze(0)
+        labels = labels.index_select(0, max_ids).unsqueeze(0) + 1
+        scores_out = scores_out.index_select(0, max_ids).unsqueeze(0)
+
+        return bboxes, labels, scores_out
+
+
     def decode_batch(self, bboxes_in, scores_in,  criteria = 0.45, max_output=200,device=0):
         bboxes, probs = self.scale_back_batch(bboxes_in, scores_in,device)
         output = []
+        # print('decode batch bbox shape:', bboxes.shape)
+        # print('decode batch probs shape:', probs.shape)
         for bbox, prob in zip(bboxes.split(1, 0), probs.split(1, 0)):
             bbox = bbox.squeeze(0)
             prob = prob.squeeze(0)
+            # print('decode single bbox:', bbox)
+            # print('decode single bbox shape:', bbox.shape)
+            # print('decode single prob:', prob)
+            # print('decode single prob shape:', prob.shape)
             output.append(self.decode_single(bbox, prob, criteria, max_output))
+            
             #print(output[-1])
         return output
 
@@ -172,22 +371,22 @@ class Encoder(object):
             # print(score[score>0.90])
             if i == 0: continue
             # print(i)
-            
             score = score.squeeze(1)
             mask = score > 0.05
 
             bboxes, score = bboxes_in[mask, :], score[mask]
             if score.size(0) == 0: continue
+            # print('decode single i & score masked:', i, score, score.shape)
 
-            score_sorted, score_idx_sorted = score.sort(dim=0)
+            score_sorted, score_idx_sorted = score.sort(dim=0, descending=True)
 
             # select max_output indices
-            score_idx_sorted = score_idx_sorted[-max_num:]
+            score_idx_sorted = score_idx_sorted[:max_num]
             candidates = []
             #maxdata, maxloc = scores_in.sort()
         
             while score_idx_sorted.numel() > 0:
-                idx = score_idx_sorted[-1].item()
+                idx = score_idx_sorted[0].item()
                 bboxes_sorted = bboxes[score_idx_sorted, :]
                 bboxes_idx = bboxes[idx, :].unsqueeze(dim=0)
                 iou_sorted = calc_iou_tensor(bboxes_sorted, bboxes_idx).squeeze()
@@ -198,14 +397,14 @@ class Encoder(object):
             bboxes_out.append(bboxes[candidates, :])
             scores_out.append(score[candidates])
             labels_out.extend([i]*len(candidates))
-
+            # print('decode single iter output:', scores_out[-1], labels_out)
         bboxes_out, labels_out, scores_out = torch.cat(bboxes_out, dim=0), \
                torch.tensor(labels_out, dtype=torch.long), \
                torch.cat(scores_out, dim=0)
 
 
-        _, max_ids = scores_out.sort(dim=0)
-        max_ids = max_ids[-max_output:]
+        _, max_ids = scores_out.sort(dim=0, descending=True)
+        max_ids = max_ids[:max_output]
         return bboxes_out[max_ids, :], labels_out[max_ids], scores_out[max_ids]
 
 

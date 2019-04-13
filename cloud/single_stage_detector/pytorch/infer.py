@@ -51,18 +51,180 @@ def dboxes_R34_coco(figsize,strides):
     #    ssd_r34.to('cuda')
     _,_,feat_size =ssd_r34(synt_img, extract_shapes = True)
     print('Features size: ', feat_size)
-    import pdb; pdb.set_trace()
+    # import pdb; pdb.set_trace()
     steps=[(int(figsize[0]/fs[0]),int(figsize[1]/fs[1])) for fs in feat_size]
     # use the scales here: https://github.com/amdegroot/ssd.pytorch/blob/master/data/config.py
     scales = [(int(s*figsize[0]/300),int(s*figsize[1]/300)) for s in [21, 45, 99, 153, 207, 261, 315]] 
     aspect_ratios =  [[2], [2, 3], [2, 3], [2, 3], [2], [2]] 
     dboxes = DefaultBoxes(figsize, feat_size, steps, scales, aspect_ratios)
+    print('dboxes from dboxes_R34_coco', dboxes)
     return dboxes
-    
+
+def coco_eval_export(model, coco, cocoGt, encoder, inv_map, threshold,device=0,use_cuda=False):
+    from pycocotools.cocoeval import COCOeval
+    model.eval()
+    if use_cuda:
+        print('use cuda')
+        model = model.to('cuda')
+    start = time.time()
+    for idx, image_id in enumerate(coco.img_keys):
+        img, (htot, wtot), _, _ = coco[idx]
+
+        with torch.no_grad():
+            print("Parsing image: {}/{}".format(idx+1, len(coco)), end="\r")
+            inp = img.unsqueeze(0)
+            if use_cuda:
+                inp = inp.to('cuda')
+            start_time=time.time()
+            ploc, plabel, out2 = model(inp)
+            time.time()-start_time
+            print('Mode inference time: ', time.time()-start_time)
+
+            # export to onnx
+            print('Save model to onnx')
+            import onnx_helper
+            model_name = 'ssd_backbone'
+            model_dir = 'test_' + model_name
+            onnx_helper.Save('.', model_name, model, [inp], [ploc, plabel], ['input1'], ['output1', 'output2'])
+
+            try:
+                result = encoder.decode_batch_with_nms_trace_new(ploc, plabel, 0.50, 200,device=device)
+                print('result:', result)
+            except Exception as e:
+                #raise
+                print(e)
+                print("No object detected in idx: {}".format(idx))
+                continue
+            print('Decoding time: ', time.time()-start_time)
+
+            print('Save decoder to onnx')
+            model_name = 'ssd_decoder'
+            model_dir = 'test_' + model_name
+
+            class Decoder(torch.nn.Module):
+                def __init__(self, encoder):
+                    super(Decoder, self).__init__()
+                    self.encoder = encoder
+
+                def forward(self, ploc, plabel):
+                    return self.encoder.decode_batch_with_nms_trace_new(ploc, plabel, 0.50, 200, device=device)
+
+            import pytorch_tmp_patch
+            def register_custom_op():
+                # experimenting custom op registration.
+                from torch.onnx.symbolic import parse_args, _cast_Int, _cast_Long
+                @parse_args('v', 'v', 'f')
+                def symbolic_nms(g, dets, scores, threshold):
+                    max_output_boxes_per_class = g.op("Constant", value_t=torch.tensor(2048, dtype=torch.int32))
+                    threshold_tensor = g.op("Constant", value_t=torch.tensor(threshold))
+                    return g.op('NonMaxSuppression', dets, scores, max_output_boxes_per_class, threshold_tensor)
+
+                def symbolic_multi_label_nms(g, boxes, scores, max_output_per_class, iou_threshold, score_threshold):
+                    max_output_per_class = _cast_Int(g, max_output_per_class, False)
+                    return _cast_Long(g, g.op('NonMaxSuppression', boxes, scores, max_output_per_class, iou_threshold, score_threshold), False)
+
+                from torch.onnx import register_custom_op_symbolic
+                register_custom_op_symbolic('roi_ops::nms', symbolic_nms)
+                register_custom_op_symbolic('roi_ops::multi_label_nms', symbolic_multi_label_nms)
+            register_custom_op()
+
+            onnx_helper.Save('.', model_name, Decoder(encoder), [ploc, plabel], result, ['input1', 'input2'], ['output1', 'output2', 'output3'])
+
+            # load back to ort
+            import onnxruntime
+            import onnx
+
+            onnx_model_path = 'test_ssd_decoder/model.onnx'
+
+            model = onnx.load(onnx_model_path)
+            model = onnx_helper.update_with_default_names(model)
+            for n in model.graph.node:
+                if n.name.find('NonMaxSuppression') >= 0 or n.name.find('ROIAlign') >= 0:
+                    n.domain = 'com.microsoft'
+            onnx.save(model, onnx_model_path)
+
+            sess = onnxruntime.InferenceSession(onnx_model_path)
+
+            out_onnx = sess.run(None, {
+                sess.get_inputs()[0].name: ploc.data.cpu().numpy(),
+                sess.get_inputs()[1].name: plabel.data.cpu().numpy()
+                })
+            print('out onnx:', out_onnx)
+            break
+
+    print("")
+    print("Export Ended, total time: {:.2f} s".format(time.time()-start))
+
+
+def coco_eval_onnx(model, coco, cocoGt, encoder, inv_map, threshold,device=0,use_cuda=False):
+    from pycocotools.cocoeval import COCOeval
+    model.eval()
+    if use_cuda:
+        print('use cuda')
+        model = model.to('cuda')
+    ret = []
+
+    import onnxruntime
+    onnx_model_path = ['test_ssd_backbone/model.onnx', 'test_ssd_decoder/model.onnx']
+    sess_backbone = onnxruntime.InferenceSession(onnx_model_path[0])
+    sess_decoder = onnxruntime.InferenceSession(onnx_model_path[1])
+
+    start = time.time()
+    for idx, image_id in enumerate(coco.img_keys):
+        img, (htot, wtot), _, _ = coco[idx]
+
+        with torch.no_grad():
+            print("Parsing image: {}/{}".format(idx+1, len(coco)), end="\r")
+            inp = img.unsqueeze(0)
+            start_time=time.time()
+            out_onnx = sess_backbone.run(None, {
+                sess_backbone.get_inputs()[0].name: inp.data.cpu().numpy()
+            })
+            ploc = out_onnx[0]
+            plabel = out_onnx[1]
+            time.time()-start_time
+            print('Mode inference time: ', time.time()-start_time)
+
+            try:
+                out_onnx = sess_decoder.run(None, {
+                    sess_decoder.get_inputs()[0].name: ploc,
+                    sess_decoder.get_inputs()[1].name: plabel
+                })
+            except Exception as e:
+                #raise
+                # TODO: need to remove the except logic. Maybe with if operator.
+                print(e)
+                print("No object detected in idx: {}".format(idx))
+                continue
+            print('Decoding time: ', time.time()-start_time)
+            loc, label, prob = out_onnx
+            print('Detections: ', label[0].shape)
+            for loc_, label_, prob_ in zip(loc[0], label[0], prob[0]):
+                ret.append([image_id, loc_[0]*wtot, \
+                                      loc_[1]*htot,
+                                      (loc_[2] - loc_[0])*wtot,
+                                      (loc_[3] - loc_[1])*htot,
+                                      prob_,
+                                      inv_map[label_]])
+
+    print("")
+    print("Predicting Ended, total time: {:.2f} s".format(time.time()-start))
+    cocoDt = cocoGt.loadRes(np.array(ret))
+
+    E = COCOeval(cocoGt, cocoDt, iouType='bbox')
+    E.evaluate()
+    E.accumulate()
+    E.summarize()
+    print("Current AP: {:.5f} AP goal: {:.5f}".format(E.stats[0], threshold))
+
+    return (E.stats[0] >= threshold) #Average Precision  (AP) @[ IoU=050:0.95 | area=   all | maxDets=100 ]
+
+
 def coco_eval(model, coco, cocoGt, encoder, inv_map, threshold,device=0,use_cuda=False):
     from pycocotools.cocoeval import COCOeval
     model.eval()
     if use_cuda:
+        print('use cuda')
         model = model.to('cuda')
     ret = []
     start = time.time()
@@ -107,7 +269,6 @@ def coco_eval(model, coco, cocoGt, encoder, inv_map, threshold,device=0,use_cuda
     return (E.stats[0] >= threshold) #Average Precision  (AP) @[ IoU=050:0.95 | area=   all | maxDets=100 ]
 
 
-
 def eval_ssd_r34_mlperf_coco(args):
     from coco import COCO
     # Check that GPUs are actually available
@@ -123,11 +284,12 @@ def eval_ssd_r34_mlperf_coco(args):
     val_coco = COCODetection(val_coco_root, val_annotate, val_trans)
     inv_map = {v:k for k,v in val_coco.label_map.items()}
 
-    ssd_r34 = SSD_R34(val_coco.labelnum,args.strides)
+    print('ssd r34')
+    ssd_r34 = SSD_R34(val_coco.labelnum, strides=args.strides)
 
     print("loading model checkpoint", args.checkpoint)
     od = torch.load(args.checkpoint, map_location=lambda storage, loc: storage)
-    import pdb; pdb.set_trace()
+    # import pdb; pdb.set_trace()
     ssd_r34.load_state_dict(od["model"])
 
     if use_cuda:
@@ -137,6 +299,8 @@ def eval_ssd_r34_mlperf_coco(args):
         loss_func.cuda(args.device)
 
     coco_eval(ssd_r34, val_coco, cocoGt, encoder, inv_map, args.threshold,args.device,use_cuda)
+    # coco_eval_onnx(ssd_r34, val_coco, cocoGt, encoder, inv_map, args.threshold,args.device,use_cuda)
+    # coco_eval_export(ssd_r34, val_coco, cocoGt, encoder, inv_map, args.threshold,args.device,use_cuda)
 
 def main():
     args = parse_args()
@@ -148,8 +312,8 @@ def main():
         print("Using seed = {}".format(args.seed))
         torch.manual_seed(args.seed)
         np.random.seed(seed=args.seed)
-    torch.cuda.set_device(args.device)
-    torch.backends.cudnn.benchmark = True
+    # torch.cuda.set_device(args.device)
+    # torch.backends.cudnn.benchmark = True
     eval_ssd_r34_mlperf_coco(args)
 
 if __name__ == "__main__":
