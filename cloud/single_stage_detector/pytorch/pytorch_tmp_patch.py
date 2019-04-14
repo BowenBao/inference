@@ -119,7 +119,7 @@ torch.onnx.utils._run_symbolic_function = _run_symbolic_function
 """
 PyTorch Exporter Ops Support
 """
-from torch.onnx.symbolic import parse_args, log, _maybe_get_const, _is_value, scalar_type_to_pytorch_type, t, _unpack_list, index_select
+from torch.onnx.symbolic import parse_args, log, _maybe_get_const, _is_value, scalar_type_to_pytorch_type, t, _unpack_list, index_select, _parse_arg
 
 @parse_args('v')
 def prim_shape(g, self):
@@ -309,3 +309,4 @@ torch.onnx.symbolic.nonzero = nonzero
 torch.onnx.symbolic.topk = topk
 torch.onnx.symbolic.min = symbolic_min
 torch.onnx.symbolic.index = index
+torch.onnx.symbolic.slice = slice
