@@ -13,12 +13,12 @@ def SaveTensorProto(file_path, name, data):
     with open(file_path, 'wb') as f:
         f.write(tp.SerializeToString())
 
-def SaveData(test_data_dir, prefix, data_list):
+def SaveData(test_data_dir, prefix, name_list, data_list):
     if isinstance(data_list, torch.autograd.Variable) or isinstance(data_list, torch.Tensor):
         data_list = [data_list]
     for i, d in enumerate(data_list):
         d = d.data.cpu().numpy()
-        SaveTensorProto(os.path.join(test_data_dir, '{0}_{1}.pb'.format(prefix, i)), prefix + str(i+1), d)
+        SaveTensorProto(os.path.join(test_data_dir, '{0}_{1}.pb'.format(prefix, i)), name_list[i], d)
 
 def Save(dir, name, model, inputs, outputs, input_names = ['input1'], output_names = ['output1']):
     if hasattr(model, 'train'):
@@ -47,8 +47,8 @@ def Save(dir, name, model, inputs, outputs, input_names = ['input1'], output_nam
     outputs = f(outputs)
     outputs = g(outputs, [])
 
-    SaveData(test_data_dir, 'input', inputs)
-    SaveData(test_data_dir, 'output', outputs)
+    SaveData(test_data_dir, 'input', input_names, inputs)
+    SaveData(test_data_dir, 'output', output_names, outputs)
 
 def update_inputs_outputs_dims(model, input_dims, output_dims):
     """
@@ -80,7 +80,7 @@ def update_inputs_outputs_dims(model, input_dims, output_dims):
     return model
 
 
-def update_with_default_names(model):
+def update_with_default_names(model, output_names=[]):
     """
         This function updates the names of the model with the default of 'OpType_id'. This is useful for models
         exported from PyTorch. Because in PyTorch ops don't have names and exported names are all unique number ids.
@@ -103,7 +103,7 @@ def update_with_default_names(model):
                 else:
                     node.input[i] = old_name_to_new_name[input_name]
         for i, output_name in enumerate(node.output):
-            if output_name[:6] == 'output':
+            if output_name[:6] == 'output' or output_name in output_names:
                 continue
             if not output_name in new_name_to_node.keys():
                 new_output_name = node.op_type + '_' + output_name

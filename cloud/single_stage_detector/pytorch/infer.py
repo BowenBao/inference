@@ -75,20 +75,24 @@ def coco_eval_export(model, coco, cocoGt, encoder, inv_map, threshold,device=0,u
             inp = img.unsqueeze(0)
             if use_cuda:
                 inp = inp.to('cuda')
+
+            class SSDModel(torch.nn.Module):
+                def __init__(self, backbone, encoder):
+                    super(SSDModel, self).__init__()
+                    self.backbone = backbone
+                    self.encoder = encoder
+
+                def forward(self, inp):
+                    ploc, plabel, _ = self.backbone(inp)
+                    return self.encoder.decode_batch_with_multi_label_nms_trace(ploc, plabel, 0.50, 200, device=device)
+            
             start_time=time.time()
             ploc, plabel, out2 = model(inp)
             time.time()-start_time
             print('Mode inference time: ', time.time()-start_time)
 
-            # export to onnx
-            print('Save model to onnx')
-            import onnx_helper
-            model_name = 'ssd_backbone'
-            model_dir = 'test_' + model_name
-            onnx_helper.Save('.', model_name, model, [inp], [ploc, plabel], ['input1'], ['output1', 'output2'])
-
             try:
-                result = encoder.decode_batch_with_nms_trace_new(ploc, plabel, 0.50, 200,device=device)
+                result = encoder.decode_batch_with_multi_label_nms_trace(ploc, plabel, 0.50, 200,device=device)
                 print('result:', result)
             except Exception as e:
                 #raise
@@ -97,18 +101,7 @@ def coco_eval_export(model, coco, cocoGt, encoder, inv_map, threshold,device=0,u
                 continue
             print('Decoding time: ', time.time()-start_time)
 
-            print('Save decoder to onnx')
-            model_name = 'ssd_decoder'
-            model_dir = 'test_' + model_name
-
-            class Decoder(torch.nn.Module):
-                def __init__(self, encoder):
-                    super(Decoder, self).__init__()
-                    self.encoder = encoder
-
-                def forward(self, ploc, plabel):
-                    return self.encoder.decode_batch_with_nms_trace_new(ploc, plabel, 0.50, 200, device=device)
-
+            # export to onnx
             import pytorch_tmp_patch
             def register_custom_op():
                 # experimenting custom op registration.
@@ -128,27 +121,31 @@ def coco_eval_export(model, coco, cocoGt, encoder, inv_map, threshold,device=0,u
                 register_custom_op_symbolic('roi_ops::multi_label_nms', symbolic_multi_label_nms)
             register_custom_op()
 
-            onnx_helper.Save('.', model_name, Decoder(encoder), [ploc, plabel], result, ['input1', 'input2'], ['output1', 'output2', 'output3'])
+            print('Save model to onnx')
+            import onnx_helper
+            model_name = 'ssd_model'
+            model_dir = 'test_' + model_name
+            onnx_helper.Save('.', model_name, SSDModel(model, encoder), [inp], result, ['image'], ['bboxes', 'labels', 'scores'])
 
             # load back to ort
             import onnxruntime
             import onnx
 
-            onnx_model_path = 'test_ssd_decoder/model.onnx'
+            onnx_model_path = 'test_ssd_model/model.onnx'
 
             model = onnx.load(onnx_model_path)
-            model = onnx_helper.update_with_default_names(model)
+            model = onnx_helper.update_with_default_names(model, ['bboxes', 'labels', 'scores'])
             for n in model.graph.node:
                 if n.name.find('NonMaxSuppression') >= 0 or n.name.find('ROIAlign') >= 0:
                     n.domain = 'com.microsoft'
+            model = onnx_helper.update_inputs_outputs_dims(model,
+                [[1, 3, 'width', 'height']],
+                [[1, 'nbox', 4], [1, 'nbox'], [1, 'nbox']])
             onnx.save(model, onnx_model_path)
 
             sess = onnxruntime.InferenceSession(onnx_model_path)
 
-            out_onnx = sess.run(None, {
-                sess.get_inputs()[0].name: ploc.data.cpu().numpy(),
-                sess.get_inputs()[1].name: plabel.data.cpu().numpy()
-                })
+            out_onnx = sess.run(None, { sess.get_inputs()[0].name: inp.data.cpu().numpy() })
             print('out onnx:', out_onnx)
             break
 
@@ -165,9 +162,8 @@ def coco_eval_onnx(model, coco, cocoGt, encoder, inv_map, threshold,device=0,use
     ret = []
 
     import onnxruntime
-    onnx_model_path = ['test_ssd_backbone/model.onnx', 'test_ssd_decoder/model.onnx']
-    sess_backbone = onnxruntime.InferenceSession(onnx_model_path[0])
-    sess_decoder = onnxruntime.InferenceSession(onnx_model_path[1])
+    onnx_model_path = 'test_ssd_model/model.onnx'
+    sess = onnxruntime.InferenceSession(onnx_model_path)
 
     start = time.time()
     for idx, image_id in enumerate(coco.img_keys):
@@ -177,27 +173,13 @@ def coco_eval_onnx(model, coco, cocoGt, encoder, inv_map, threshold,device=0,use
             print("Parsing image: {}/{}".format(idx+1, len(coco)), end="\r")
             inp = img.unsqueeze(0)
             start_time=time.time()
-            out_onnx = sess_backbone.run(None, {
-                sess_backbone.get_inputs()[0].name: inp.data.cpu().numpy()
+            out_onnx = sess.run(None, {
+                sess.get_inputs()[0].name: inp.data.cpu().numpy()
             })
-            ploc = out_onnx[0]
-            plabel = out_onnx[1]
             time.time()-start_time
-            print('Mode inference time: ', time.time()-start_time)
-
-            try:
-                out_onnx = sess_decoder.run(None, {
-                    sess_decoder.get_inputs()[0].name: ploc,
-                    sess_decoder.get_inputs()[1].name: plabel
-                })
-            except Exception as e:
-                #raise
-                # TODO: need to remove the except logic. Maybe with if operator.
-                print(e)
-                print("No object detected in idx: {}".format(idx))
-                continue
-            print('Decoding time: ', time.time()-start_time)
+            print('Detection time: ', time.time()-start_time)
             loc, label, prob = out_onnx
+
             print('Detections: ', label[0].shape)
             for loc_, label_, prob_ in zip(loc[0], label[0], prob[0]):
                 ret.append([image_id, loc_[0]*wtot, \
@@ -298,8 +280,8 @@ def eval_ssd_r34_mlperf_coco(args):
     if use_cuda:
         loss_func.cuda(args.device)
 
-    coco_eval(ssd_r34, val_coco, cocoGt, encoder, inv_map, args.threshold,args.device,use_cuda)
-    # coco_eval_onnx(ssd_r34, val_coco, cocoGt, encoder, inv_map, args.threshold,args.device,use_cuda)
+    # coco_eval(ssd_r34, val_coco, cocoGt, encoder, inv_map, args.threshold,args.device,use_cuda)
+    coco_eval_onnx(ssd_r34, val_coco, cocoGt, encoder, inv_map, args.threshold,args.device,use_cuda)
     # coco_eval_export(ssd_r34, val_coco, cocoGt, encoder, inv_map, args.threshold,args.device,use_cuda)
 
 def main():

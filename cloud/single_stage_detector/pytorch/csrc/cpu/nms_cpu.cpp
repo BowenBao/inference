@@ -132,7 +132,8 @@ at::Tensor multi_label_nms_cpu_kernel(const at::Tensor& boxes,
         suppressed[i] = 1;
         continue;
       }
-      nleft++;
+      // Add count here to match behavior of original SSD model in this repo.
+      // nleft++;
       if (suppressed[i] == 1)
         continue;
       auto ix1 = x1[i];
@@ -157,6 +158,8 @@ at::Tensor multi_label_nms_cpu_kernel(const at::Tensor& boxes,
         if (ovr >= iou_thres)
           suppressed[j] = 1;
       }
+      // Add count here to match behavior of ONNXRuntime NMS implementation.
+      nleft++;
     }
     auto selected_idx = at::nonzero(suppressed_t == 0).squeeze(1);
     auto nselected = selected_idx.size(0);
