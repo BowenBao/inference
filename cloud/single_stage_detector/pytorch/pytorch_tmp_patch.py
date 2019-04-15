@@ -296,6 +296,21 @@ def slice(g, self, dim, start, end, step):
         step_tensor = g.op('Constant', value_t=torch.tensor([step], dtype=torch.long))
         return g.op("Slice", self, start_tensor, end_tensor, dim_tensor, step_tensor)
 
+@parse_args('v', 'i', 'v')
+def select(g, self, dim, index):
+    if dim > 1:
+        # TODO: this is a temporary hack because of the implementation details
+        # of Gather in caffe2. We need to change this as soon as possible.
+        # TODO: this breaks if index == -1
+        index_val = _parse_arg(index, 'i')
+        slice_node = slice(g, self,
+            g.op("Constant", value_t=torch.tensor(dim, dtype=torch.long)),
+            g.op("Constant", value_t=torch.tensor(index_val, dtype=torch.long)),
+            g.op("Constant", value_t=torch.tensor(index_val+1, dtype=torch.long)),
+            g.op("Constant", value_t=torch.tensor(1, dtype=torch.long))) #g.op("Slice", self, axes_i=[dim], starts_i=[index_val], ends_i=[index_val + 1])
+        return g.op("Squeeze", slice_node, axes_i=[dim])
+    else:
+        return g.op("Gather", self, index, axis_i=dim)
 
 torch.onnx.symbolic._default_onnx_opset_version = 10
 
@@ -310,3 +325,4 @@ torch.onnx.symbolic.topk = topk
 torch.onnx.symbolic.min = symbolic_min
 torch.onnx.symbolic.index = index
 torch.onnx.symbolic.slice = slice
+torch.onnx.symbolic.select = select

@@ -596,13 +596,15 @@ class SSDTransformer(object):
 
     def __call__(self, img, img_size, bbox=None, label=None, max_num=200):
         #img = torch.tensor(img)
+        print('Transformer: start transforming.')
         if self.val:
+            print('Resize image')
             bbox_out = torch.zeros(max_num, 4)
             label_out =  torch.zeros(max_num, dtype=torch.long)
             bbox_out[:bbox.size(0), :] = bbox
             label_out[:label.size(0)] = label
             return self.trans_val(img), img_size, bbox_out, label_out
-   
+        print('more transform like crop and normalize')
         #print("before", img.size, bbox)
         img, img_size, bbox, label = self.crop(img, img_size, bbox, label)
         #print("after", img.size, bbox)

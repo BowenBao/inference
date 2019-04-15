@@ -33,6 +33,8 @@ def parse_args():
     parser.add_argument('--strides', default=[3,3,2,2,2,2], type=int, nargs='+',
                         help='stides for ssd model must include 6 numbers')                                       
     parser.add_argument('--use-fp16', action='store_true')                          
+    parser.add_argument('--onnx', '-o', type=str, default=None,
+                        help='mode for onnx \{export, eval\}.')
     return parser.parse_args()
 
 
@@ -280,9 +282,13 @@ def eval_ssd_r34_mlperf_coco(args):
     if use_cuda:
         loss_func.cuda(args.device)
 
-    # coco_eval(ssd_r34, val_coco, cocoGt, encoder, inv_map, args.threshold,args.device,use_cuda)
-    coco_eval_onnx(ssd_r34, val_coco, cocoGt, encoder, inv_map, args.threshold,args.device,use_cuda)
-    # coco_eval_export(ssd_r34, val_coco, cocoGt, encoder, inv_map, args.threshold,args.device,use_cuda)
+    if args.onnx:
+        if args.onnx == 'export':
+            return coco_eval_export(ssd_r34, val_coco, cocoGt, encoder, inv_map, args.threshold,args.device,use_cuda)
+        elif args.onnx == 'eval':
+            return coco_eval_onnx(ssd_r34, val_coco, cocoGt, encoder, inv_map, args.threshold,args.device,use_cuda)
+    return coco_eval(ssd_r34, val_coco, cocoGt, encoder, inv_map, args.threshold,args.device,use_cuda)
+
 
 def main():
     args = parse_args()

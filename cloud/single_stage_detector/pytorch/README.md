@@ -48,3 +48,22 @@ mAP of 0.224
 
 ### Evaluation thoroughness
 All the images in COCO 2017 val data set.
+
+# 6. ONNX.
+### Prerequisite
+The following is verified against PyTorch master(https://github.com/pytorch/pytorch/tree/00148825fc35ddada2cfc59a30d904e0d8cace7c), and ONNXRuntime branch(https://github.com/BowenBao/onnxruntime/tree/bowbao/maxpool_v10_tmp, for MaxPool opset 10), on python version 3.7
+
+### Build the project with custom op support
+```
+python setup.py develop
+```
+
+### Export to ONNX
+```
+./export_to_onnx.sh
+```
+
+### Run in ONNXRuntime
+```
+python onnx_demo.py
+```
