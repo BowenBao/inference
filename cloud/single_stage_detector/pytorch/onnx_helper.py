@@ -20,7 +20,7 @@ def SaveData(test_data_dir, prefix, name_list, data_list):
         d = d.data.cpu().numpy()
         SaveTensorProto(os.path.join(test_data_dir, '{0}_{1}.pb'.format(prefix, i)), name_list[i], d)
 
-def Save(dir, name, model, inputs, outputs, input_names = ['input1'], output_names = ['output1']):
+def Save(dir, name, model, inputs, outputs, input_names = ['input1'], output_names = ['output1'], do_constant_folding=False):
     if hasattr(model, 'train'):
         model.train(False)
     if not os.path.exists(dir):
@@ -36,7 +36,7 @@ def Save(dir, name, model, inputs, outputs, input_names = ['input1'], output_nam
             res.append(i) if not isinstance(i, (list, tuple)) else g(i, res)
         return res
 
-    torch.onnx.export(model, tuple(inputs), os.path.join(dir, 'model.onnx'), verbose=True, input_names=input_names, output_names=output_names)
+    torch.onnx.export(model, tuple(inputs), os.path.join(dir, 'model.onnx'), verbose=True, input_names=input_names, output_names=output_names, do_constant_folding=do_constant_folding)
 
     test_data_dir = os.path.join(dir, data_dir)
     if not os.path.exists(test_data_dir):

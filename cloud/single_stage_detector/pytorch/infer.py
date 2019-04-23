@@ -108,18 +108,10 @@ def coco_eval_export(model, coco, cocoGt, encoder, inv_map, threshold,device=0,u
             def register_custom_op():
                 # experimenting custom op registration.
                 from torch.onnx.symbolic import parse_args, _cast_Int, _cast_Long
-                @parse_args('v', 'v', 'f')
-                def symbolic_nms(g, dets, scores, threshold):
-                    max_output_boxes_per_class = g.op("Constant", value_t=torch.tensor(2048, dtype=torch.int32))
-                    threshold_tensor = g.op("Constant", value_t=torch.tensor(threshold))
-                    return g.op('NonMaxSuppression', dets, scores, max_output_boxes_per_class, threshold_tensor)
-
                 def symbolic_multi_label_nms(g, boxes, scores, max_output_per_class, iou_threshold, score_threshold):
-                    max_output_per_class = _cast_Int(g, max_output_per_class, False)
-                    return _cast_Long(g, g.op('NonMaxSuppression', boxes, scores, max_output_per_class, iou_threshold, score_threshold), False)
+                    return g.op('NonMaxSuppression', boxes, scores, max_output_per_class, iou_threshold, score_threshold)
 
                 from torch.onnx import register_custom_op_symbolic
-                register_custom_op_symbolic('roi_ops::nms', symbolic_nms)
                 register_custom_op_symbolic('roi_ops::multi_label_nms', symbolic_multi_label_nms)
             register_custom_op()
 
@@ -127,7 +119,7 @@ def coco_eval_export(model, coco, cocoGt, encoder, inv_map, threshold,device=0,u
             import onnx_helper
             model_name = 'ssd_model'
             model_dir = 'test_' + model_name
-            onnx_helper.Save('.', model_name, SSDModel(model, encoder), [inp], result, ['image'], ['bboxes', 'labels', 'scores'])
+            onnx_helper.Save('.', model_name, SSDModel(model, encoder), [inp], result, ['image'], ['bboxes', 'labels', 'scores'], do_constant_folding=True)
 
             # load back to ort
             import onnxruntime
@@ -137,11 +129,8 @@ def coco_eval_export(model, coco, cocoGt, encoder, inv_map, threshold,device=0,u
 
             model = onnx.load(onnx_model_path)
             model = onnx_helper.update_with_default_names(model, ['bboxes', 'labels', 'scores'])
-            for n in model.graph.node:
-                if n.name.find('NonMaxSuppression') >= 0 or n.name.find('ROIAlign') >= 0:
-                    n.domain = 'com.microsoft'
             model = onnx_helper.update_inputs_outputs_dims(model,
-                [[1, 3, 'width', 'height']],
+                [[1, 3, 1200, 1200]],
                 [[1, 'nbox', 4], [1, 'nbox'], [1, 'nbox']])
             onnx.save(model, onnx_model_path)
 
